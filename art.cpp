@@ -23,6 +23,10 @@ const long double pi = 3.14159265358979323846L;
 // height / width of one terminal cell (usually about 2)
 const double CELL_ASPECT = 2.0;
 
+// colour rule works in linear light (what the eye really averages).
+// set to 1.0 for the literal "raw 0-255 value x coverage" rule.
+const double GAMMA = 2.2;
+
 struct RGB { unsigned r, g, b; };
 using color = vector<vector<RGB>>;
 using gray  = vector<vector<unsigned>>;
@@ -218,6 +222,7 @@ class image {
         gray bw;
         gray gradient;
         vector<vector<long double>> angle;
+        unsigned max_gradeint=1;
     public:
         image(color &path) {
             img = path;
@@ -228,34 +233,37 @@ class image {
             angle    = vector<vector<long double>>(h, vector<long double>(w, 0.0L));
         }
 
-        // useValue = true  -> brightness = max(R,G,B)  (needed for the colour rule)
-        // useValue = false -> brightness = luminance   (plain grey output)
-        void convert(bool useValue) {
+        // one brightness rule for every mode: luminance.
+        // colour is NOT used here, it only appears at the very last stage (print).
+        void convert() {
             for (int x = 0; x < h; x++)
                 for (int y = 0; y < w; y++) {
                     const RGB &p = img[x][y];
-                    bw[x][y] = useValue
-                        ? max({p.r, p.g, p.b})
-                        : (unsigned)(0.299 * p.r + 0.587 * p.g + 0.114 * p.b);
+                    bw[x][y] = (unsigned)(0.299 * p.r + 0.587 * p.g + 0.114 * p.b);
                 }
         }
 
         void grad() {
             int Gx[3][3] = {{-1, 0, 1}, {-2, 0, 2}, {-1, 0, 1}};
             int Gy[3][3] = {{-1,-2,-1}, { 0, 0, 0}, { 1, 2, 1}};
+            unsigned n=1;
             for (int y = 1; y < h - 1; ++y)
                 for (int x = 1; x < w - 1; ++x) {
                     float gradx = 0, grady = 0;
                     for (int ky = -1; ky <= 1; ++ky)
                         for (int kx = -1; kx <= 1; ++kx) {
-                            unsigned p = bw[y + ky][x + kx];
+                            int p =(int) bw[y + ky][x + kx];
                             gradx += p * Gx[ky + 1][kx + 1];
                             grady += p * Gy[ky + 1][kx + 1];
                         }
-                    float m = sqrt(gradx * gradx + grady * grady);
-                    gradient[y][x] = static_cast<unsigned>(min(255.0f, max(0.0f, m)));
+                    float m = sqrt((float)gradx * gradx + (float)grady * grady);
+                    gradient[y][x] = static_cast<unsigned>(m);
                     angle[y][x] = (long double)atan2(grady, gradx);
+                    if(gradient[y][x]>n){
+                        n=gradient[y][x];
+                    };
                 }
+                max_gradeint=n;
             // Sobel skips the 1-pixel border; copy the nearest inner value so border cells are not treated as flat
             if (h > 2 && w > 2) {
                 for (int x = 0; x < w; x++) {
@@ -280,7 +288,7 @@ class image {
                     long double sy  = sinl(th);
                     long double cx  = cosl(th);
                     // Magnitude in [0, 255] using |sin(angle)| as the edge penalty
-                    long double mag = wi * bw[x][y] + wg * gradient[x][y] * fabsl(sy);
+                    long double mag = (wi * (bw[x][y]*178/255) + wg *(gradient[x][y]*178/max_gradeint)) ;
                     // Negative when Gy < 0 (sy < 0), or when Gy == 0 and Gx < 0 (cx < 0 on vertical edge)
                     long double sgn = 1.0L;
                     if (gradient[x][y] > 0) {
@@ -295,9 +303,10 @@ class image {
 
 struct table {
     string s;
-    long double intensity;   // W(I, deg) : signed effective value in [-178, +178]
+    long double intensity;   // W(I, deg) : signed value, used ONLY to select the glyph
+    long double ink;         // I : real scale 0..178, used ONLY for colouring (coverage)
 };
-table E(const string &c, long double I, long double deg) { return {c, W(I, deg)}; }
+table E(const string &c, long double I, long double deg) { return {c, W(I, deg), I}; }
 
 // ---------------- art class ----------------
 class art : private image {
@@ -403,12 +412,16 @@ class art : private image {
             E("&", 178.0, -80)   // -175.30
         };
         vector<vector<double>> cover;   // ink coverage (0..1) of the glyph chosen for each cell
+        color paint;                    // colour source for the last stage (empty -> use img)
 
     public:
         art(color &c) : image(c) {}
 
-        vector<vector<string>> draw(float wi, float wg, bool colorOn) {
-            this->convert(colorOn);
+        // optional: a differently averaged copy of the image (e.g. HSV) used ONLY for colouring
+        void setPaint(const color &p) { paint = p; }
+
+        vector<vector<string>> draw(float wi, float wg) {
+            this->convert();
             this->grad();
             vector<vector<long double>> flex = this->flexer(wi, wg);
 
@@ -417,58 +430,46 @@ class art : private image {
             vector<vector<string>> out(rows, vector<string>(cols));
             cover.assign(rows, vector<double>(cols, 1.0));
 
-            long double maxFlex = 0, maxT = 0;
+            long double maxFlex = 0, maxT = 0, maxInk = 0;
             for (int x = 0; x < rows; x++)
                 for (int y = 0; y < cols; y++)
                     maxFlex = max(maxFlex, fabsl(flex[x][y]));
             for (size_t i = 0; i < T.size(); i++)
-                maxT = max(maxT, fabsl(T[i].intensity));
+            {
+                maxT   = max(maxT,   fabsl(T[i].intensity));
+                maxInk = max(maxInk, T[i].ink);
+            }
             long double scale = (maxFlex > 0) ? maxT / maxFlex : 0;
 
             for (int x = 0; x < rows; x++)
                 for (int y = 0; y < cols; y++) {
                     // Keep the sign of flex[x][y] so + selects positive glyphs and - selects negative glyphs
                     long double v  = flex[x][y] * scale;
-                    long double Vn = max({img[x][y].r, img[x][y].g, img[x][y].b}) / 255.0L;
-
-                    // colour mode: coverage k must satisfy k >= Vn (colour <= 255)
-                    // and stay close to Vn, so colour = block / k keeps full brightness
-                    long double kmax = 1e9L, kfloor = Vn;
-                    if (colorOn) {
-                        long double kmin = 1e9L, maxSignK = 0.0L;
-                        for (size_t i = 0; i < T.size(); i++) {
-                            if (v * T[i].intensity < 0) continue;
-                            long double k = fabsl(T[i].intensity) / maxT;
-                            maxSignK = max(maxSignK, k);
-                            if (k + 1e-9L >= Vn) kmin = min(kmin, k);
-                        }
-                        if (kmin > 1e8L) {
-                            kmin = maxSignK;
-                            kfloor = maxSignK - 1e-9L;
-                        }
-                        kmax = kmin * 1.15L + 0.02L;
-                    }
-
                     size_t best = 0;
                     long double bestDist = 1e30L;
                     for (size_t i = 0; i < T.size(); i++) {
-                        long double k = fabsl(T[i].intensity) / maxT;
-                        if (colorOn && (v * T[i].intensity < 0 || k + 1e-9L < kfloor || k > kmax)) continue;
                         long double d = fabsl(v - T[i].intensity);
                         if (d < bestDist) { bestDist = d; best = i; }
                     }
                     out[x][y] = T[best].s;
-                    cover[x][y] = (double)(fabsl(T[best].intensity) / maxT);
+                    cover[x][y] = (double)(T[best].ink / maxInk);
                 }
             return out;
         }
 
-        // glyph colour * glyph coverage = block colour  ->  glyph colour = block colour / coverage
+        // glyph colour * glyph coverage = block colour (in linear light)
+        // -> glyph colour = block colour / coverage.
+        // If any channel would exceed 1, all three are scaled by the same factor, so the hue is kept.
         RGB cellColor(int x, int y) const {
-            const RGB &m = img[x][y];
+            const RGB &m = paint.empty() ? img[x][y] : paint[x][y];
             double k = max(1e-3, cover[x][y]);          // only guards divide-by-zero
-            auto f = [&](unsigned c) { return (unsigned)lround(min(255.0, c / k)); };
-            return {f(m.r), f(m.g), f(m.b)};
+            double lin[3] = { pow(m.r / 255.0, GAMMA) / k,
+                              pow(m.g / 255.0, GAMMA) / k,
+                              pow(m.b / 255.0, GAMMA) / k };
+            double mx = max({lin[0], lin[1], lin[2]});
+            if (mx > 1.0) for (double &v : lin) v /= mx;
+            auto f = [](double v) { return (unsigned)lround(255.0 * pow(v, 1.0 / GAMMA)); };
+            return {f(lin[0]), f(lin[1]), f(lin[2])};
         }
 
         void print(const vector<vector<string>> &out, int colorMode, int delayMs) {
@@ -540,11 +541,14 @@ int main(int argc, char **argv) {
         C = min(cols, max(1, (int)lround(R * CELL_ASPECT * sw / sh)));
     }
 
-    color small = resizeImage(src, C, R, mode == 2 ? 2 : 1);
+    // glyph selection always uses the plain RGB-averaged image, so modes 0/1/2 pick identical glyphs
+    color small = resizeImage(src, C, R, 1);
     art a(small);
+    // mode 2 only changes which colour paints the glyph (HSV-averaged copy)
+    if (mode == 2) a.setPaint(resizeImage(src, C, R, 2));
     
     // Pass the tuned weights into draw()
-    auto out = a.draw(wi, wg, mode != 0);
+    auto out = a.draw(wi, wg);
     a.print(out, mode, 20);
     return 0;
 }
